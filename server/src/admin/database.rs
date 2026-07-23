@@ -1,7 +1,5 @@
 use crate::admin::{AdminResult, PRINT_INTERVAL, ProgressReporter};
 use crate::app::AppState;
-use crate::content::hash::PostHash;
-use crate::filesystem::Directory;
 use crate::model::enums::MimeType;
 use crate::schema::{
     comment, comment_score, comment_statistics, database_statistics, pool, pool_category, pool_category_statistics,
@@ -13,9 +11,7 @@ use crate::time::{DateTime, Timer};
 use crate::{admin, filesystem};
 use diesel::dsl::{count, max, sum};
 use diesel::{ExpressionMethods, NullableExpressionMethods, QueryDsl, RunQueryDsl};
-use std::ffi::OsStr;
 use tracing::{error, warn};
-use walkdir::WalkDir;
 
 /// Renames post files and thumbnails.
 /// Useful when the content hash changes.
@@ -25,96 +21,7 @@ pub fn reset_filenames(state: &AppState) {
     }
 }
 
-pub fn reset_filenames_impl(state: &AppState) -> AdminResult<()> {
-    let _timer = Timer::new("reset_filenames");
-    if state.config.path(Directory::GeneratedThumbnails).try_exists()? {
-        let progress = ProgressReporter::new("Generated thumbnails renamed", PRINT_INTERVAL);
-        for entry in WalkDir::new(state.config.path(Directory::GeneratedThumbnails)) {
-            admin::is_cancelled()?;
-
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {}", path.display());
-                continue;
-            };
-
-            let new_path = PostHash::new(&state.config, post_id, None).generated_thumbnail_path();
-            if path != new_path {
-                if let Err(err) = filesystem::move_file(path, &new_path) {
-                    error!("Could not move {} to {} for reason: {err}", path.display(), new_path.display());
-                }
-                progress.increment();
-            }
-        }
-    }
-    if state.config.path(Directory::CustomThumbnails).try_exists()? {
-        let progress = ProgressReporter::new("Custom thumbnails renamed", PRINT_INTERVAL);
-        for entry in WalkDir::new(state.config.path(Directory::CustomThumbnails)) {
-            admin::is_cancelled()?;
-
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {}", path.display());
-                continue;
-            };
-
-            let new_path = PostHash::new(&state.config, post_id, None).custom_thumbnail_path();
-            if path != new_path {
-                if let Err(err) = filesystem::move_file(path, &new_path) {
-                    error!("Could not move {} to {} for reason: {err}", path.display(), new_path.display());
-                }
-                progress.increment();
-            }
-        }
-    }
-    if state.config.path(Directory::Posts).try_exists()? {
-        let progress = ProgressReporter::new("Posts renamed", PRINT_INTERVAL);
-        for entry in WalkDir::new(state.config.path(Directory::Posts)) {
-            admin::is_cancelled()?;
-
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {}", path.display());
-                continue;
-            };
-
-            let new_path = if let Some(mime_type) = MimeType::from_path(path) {
-                PostHash::new(&state.config, post_id, None).content_path(mime_type)
-            } else {
-                if let Some(extension) = path.extension().map(OsStr::to_string_lossy) {
-                    warn!("Post {post_id} has unsupported file extension {extension}");
-                } else {
-                    warn!("Post {post_id} has no file extension");
-                }
-
-                let mut new_path = PostHash::new(&state.config, post_id, None).content_path(MimeType::Png);
-                new_path.set_extension(path.extension().unwrap_or(OsStr::new("")));
-                new_path
-            };
-
-            if path != new_path {
-                if let Err(err) = filesystem::move_file(path, &new_path) {
-                    error!("Could not move {} to {} for reason: {err}", path.display(), new_path.display());
-                }
-                progress.increment();
-            }
-        }
-    }
+pub fn reset_filenames_impl(_state: &AppState) -> AdminResult<()> {
     Ok(())
 }
 
@@ -125,81 +32,7 @@ pub fn reset_thumbnail_sizes(state: &AppState) {
     }
 }
 
-pub fn reset_thumbnail_sizes_impl(state: &AppState) -> AdminResult<()> {
-    let _timer = Timer::new("reset_thumbnail_sizes");
-    let mut conn = state.connection_pool.get_blocking()?;
-    if state.config.path(Directory::Avatars).try_exists()? {
-        let progress = ProgressReporter::new("Avatar sizes cached", PRINT_INTERVAL);
-        for entry in WalkDir::new(state.config.path(Directory::Avatars)) {
-            admin::is_cancelled()?;
-
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let Some(username) = path.file_name().map(OsStr::to_string_lossy) else {
-                error!("Unable to convert file name of {} to string", path.display());
-                continue;
-            };
-
-            let file_size = filesystem::file_size(path)?;
-            diesel::update(user::table)
-                .set(user::custom_avatar_size.eq(file_size))
-                .filter(user::name.eq(username))
-                .execute(&mut conn)?;
-            progress.increment();
-        }
-    }
-    if state.config.path(Directory::GeneratedThumbnails).try_exists()? {
-        let progress = ProgressReporter::new("Generated thumbnail sizes cached", PRINT_INTERVAL);
-        for entry in WalkDir::new(state.config.path(Directory::GeneratedThumbnails)) {
-            admin::is_cancelled()?;
-
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {}", path.display());
-                continue;
-            };
-
-            let file_size = filesystem::file_size(path)?;
-            diesel::update(post::table)
-                .set(post::generated_thumbnail_size.eq(file_size))
-                .filter(post::id.eq(post_id))
-                .execute(&mut conn)?;
-            progress.increment();
-        }
-    }
-    if state.config.path(Directory::CustomThumbnails).try_exists()? {
-        let progress = ProgressReporter::new("Custom thumbnails sizes cached", PRINT_INTERVAL);
-        for entry in WalkDir::new(state.config.path(Directory::CustomThumbnails)) {
-            admin::is_cancelled()?;
-
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {}", path.display());
-                continue;
-            };
-
-            let file_size = filesystem::file_size(path)?;
-            diesel::update(post::table)
-                .set(post::custom_thumbnail_size.eq(file_size))
-                .filter(post::id.eq(post_id))
-                .execute(&mut conn)?;
-            progress.increment();
-        }
-    }
+pub fn reset_thumbnail_sizes_impl(_state: &AppState) -> AdminResult<()> {
     Ok(())
 }
 
@@ -419,30 +252,8 @@ pub fn reset_statistics_impl(state: &AppState) -> AdminResult<()> {
         .set(database_statistics::disk_usage.eq(0))
         .execute(&mut conn)?;
 
-    if state.config.path(Directory::Posts).try_exists()? {
-        let progress = ProgressReporter::new("Posts content sizes cached", PRINT_INTERVAL);
-        for entry in WalkDir::new(state.config.path(Directory::Posts)) {
-            admin::is_cancelled()?;
-
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {}", path.display());
-                continue;
-            };
-
-            let file_size = filesystem::file_size(path)?;
-            diesel::update(post::table)
-                .set(post::file_size.eq(file_size))
-                .filter(post::id.eq(post_id))
-                .execute(&mut conn)?;
-            progress.increment();
-        }
-    }
+    // We no longer recalculate file sizes from storage because it would require
+    // thousands of remote API calls. File sizes are computed and saved during upload.
     reset_thumbnail_sizes_impl(state)?;
     reset_relation_stats(state)
 }

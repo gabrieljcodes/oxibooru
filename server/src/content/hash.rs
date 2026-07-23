@@ -11,11 +11,10 @@ use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::Bytea;
 use diesel::{FromSqlRow, deserialize, serialize};
 use hex::{FromHex, FromHexError};
-use std::cell::Cell;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 /// Stores a `post_id` and cached post `hash`.
@@ -23,7 +22,7 @@ pub struct PostHash<'a> {
     post_id: i64,
     hash: String,
     config: &'a Config,
-    has_custom_thumbnail: Cell<Option<bool>>,
+    has_custom_thumbnail: Option<bool>,
 }
 
 impl<'a> PostHash<'a> {
@@ -40,7 +39,7 @@ impl<'a> PostHash<'a> {
             hash: URL_SAFE_NO_PAD.encode(hash.as_bytes()),
             post_id,
             config,
-            has_custom_thumbnail: Cell::new(custom_thumbnail_size.map(|size| size > 0)),
+            has_custom_thumbnail: custom_thumbnail_size.map(|size| size > 0),
         }
     }
 
@@ -69,31 +68,26 @@ impl<'a> PostHash<'a> {
         format!("{}/{thumbnail_folder}/{self}.{THUMBNAIL_EXTENSION}", self.config.data_url.trim_end_matches('/'))
     }
 
-    /// Returns path to post content on disk.
-    pub fn content_path(&self, content_type: MimeType) -> PathBuf {
-        let filename = format!("{self}.{}", content_type.extension());
-        self.config.path(Directory::Posts).join(filename)
+    /// Returns key for post content.
+    pub fn content_key(&self, content_type: MimeType) -> String {
+        let folder: &str = Directory::Posts.into();
+        format!("{folder}/{self}.{}", content_type.extension())
     }
 
-    /// Returns path to generated post thumbnail on disk.
-    pub fn generated_thumbnail_path(&self) -> PathBuf {
-        let filename = format!("{self}.{THUMBNAIL_EXTENSION}");
-        self.config.path(Directory::GeneratedThumbnails).join(filename)
+    /// Returns key for generated post thumbnail.
+    pub fn generated_thumbnail_key(&self) -> String {
+        let folder: &str = Directory::GeneratedThumbnails.into();
+        format!("{folder}/{self}.{THUMBNAIL_EXTENSION}")
     }
 
-    /// Returns path to custom post thumbnail on disk.
-    pub fn custom_thumbnail_path(&self) -> PathBuf {
-        let filename = format!("{self}.{THUMBNAIL_EXTENSION}");
-        self.config.path(Directory::CustomThumbnails).join(filename)
+    /// Returns key for custom post thumbnail.
+    pub fn custom_thumbnail_key(&self) -> String {
+        let folder: &str = Directory::CustomThumbnails.into();
+        format!("{folder}/{self}.{THUMBNAIL_EXTENSION}")
     }
 
     fn has_custom_thumbnail(&self) -> bool {
-        self.has_custom_thumbnail.get().unwrap_or_else(|| {
-            // If it is not known, check filesystem
-            let custom_thumbnail_exists = self.custom_thumbnail_path().exists();
-            self.has_custom_thumbnail.replace(Some(custom_thumbnail_exists));
-            custom_thumbnail_exists
-        })
+        self.has_custom_thumbnail.unwrap_or(false)
     }
 }
 

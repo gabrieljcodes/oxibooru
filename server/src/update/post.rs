@@ -3,9 +3,8 @@ use crate::app::Context;
 use crate::config::Config;
 use crate::content::hash::PostHash;
 use crate::content::thumbnail::ThumbnailCategory;
-use crate::filesystem;
 use crate::model::comment::OrphanedComment;
-use crate::model::enums::{ResourceProperty, ResourceType};
+use crate::model::enums::{MimeType, ResourceProperty, ResourceType};
 use crate::model::pool::PoolPost;
 use crate::model::post::{
     CompressedSignature, OrphanedPostFeature, Post, PostFavorite, PostRelation, PostScore, PostTag, SignatureIndexes,
@@ -18,7 +17,6 @@ use crate::schema::{
 use crate::time::DateTime;
 use diesel::dsl::exists;
 use diesel::{ExpressionMethods, Insertable, PgConnection, QueryDsl, QueryResult, RunQueryDsl};
-use image::DynamicImage;
 use std::collections::HashSet;
 
 /// Updates `last_edit_time` of post associated with `post_id`.
@@ -33,11 +31,9 @@ pub fn last_edit_time(conn: &mut PgConnection, post_id: i64) -> ApiResult<()> {
 pub fn thumbnail(
     conn: &mut PgConnection,
     post_hash: &PostHash,
-    thumbnail: DynamicImage,
+    thumbnail_size: i64,
     thumbnail_type: ThumbnailCategory,
 ) -> ApiResult<()> {
-    filesystem::delete_post_thumbnail(post_hash, thumbnail_type)?;
-    let thumbnail_size = filesystem::save_post_thumbnail(post_hash, thumbnail, thumbnail_type)?;
     match thumbnail_type {
         ThumbnailCategory::Generated => diesel::update(post::table.find(post_hash.id()))
             .set(post::generated_thumbnail_size.eq(thumbnail_size))
@@ -125,6 +121,18 @@ pub fn set_notes(conn: &mut PgConnection, post_id: i64, notes: &[Note]) -> Query
     Ok(())
 }
 
+pub struct PostMergeActions {
+    pub swap_posts: bool,
+    pub absorbed_id: i64,
+    pub absorbed_custom_thumbnail_size: Option<i64>,
+    pub absorbed_mime: MimeType,
+    pub merge_to_id: i64,
+    pub merge_to_custom_thumbnail_size: Option<i64>,
+    pub merge_to_mime: MimeType,
+    pub delete_source_files: bool,
+    pub deleted_content_type: MimeType,
+}
+
 /// Merges `absorbed_post` to `merge_to_post`.
 ///
 /// Merged post resources typically follow a delete-then-insert pattern even
@@ -137,11 +145,11 @@ pub fn merge(
     absorbed_post: &Post,
     merge_to_post: &Post,
     replace_content: bool,
-) -> ApiResult<()> {
+) -> ApiResult<PostMergeActions> {
     let absorbed_id = absorbed_post.id;
     let merge_to_id = merge_to_post.id;
-    let absorbed_hash = PostHash::new(config, absorbed_id, Some(absorbed_post.custom_thumbnail_size));
-    let merge_to_hash = PostHash::new(config, merge_to_id, Some(merge_to_post.custom_thumbnail_size));
+    let _absorbed_hash = PostHash::new(config, absorbed_id, Some(absorbed_post.custom_thumbnail_size));
+    let _merge_to_hash = PostHash::new(config, merge_to_id, Some(merge_to_post.custom_thumbnail_size));
 
     // Merge relations
     let involved_relations: Vec<PostRelation> = post_relation::table
@@ -296,14 +304,6 @@ pub fn merge(
     diesel::delete(post::table.find(absorbed_id)).execute(conn)?;
 
     if replace_content {
-        filesystem::swap_posts(
-            config,
-            &absorbed_hash,
-            absorbed_post.mime_type,
-            &merge_to_hash,
-            merge_to_post.mime_type,
-        )?;
-
         // If replacing content, update metadata. This needs to be done after deletion because checksum has UNIQUE constraint
         diesel::update(post::table.find(merge_to_post.id))
             .set((
@@ -322,14 +322,23 @@ pub fn merge(
             .execute(conn)?;
     }
 
-    if config.delete_source_files {
-        let deleted_content_type = if replace_content {
-            merge_to_post.mime_type
-        } else {
-            absorbed_post.mime_type
-        };
-        filesystem::delete_post(&absorbed_hash, deleted_content_type)?;
-    }
     last_edit_time(conn, merge_to_id)?;
-    Ok(())
+    
+    let deleted_content_type = if replace_content {
+        merge_to_post.mime_type
+    } else {
+        absorbed_post.mime_type
+    };
+    
+    Ok(PostMergeActions {
+        swap_posts: replace_content,
+        absorbed_id,
+        absorbed_custom_thumbnail_size: Some(absorbed_post.custom_thumbnail_size),
+        absorbed_mime: absorbed_post.mime_type,
+        merge_to_id,
+        merge_to_custom_thumbnail_size: Some(merge_to_post.custom_thumbnail_size),
+        merge_to_mime: merge_to_post.mime_type,
+        delete_source_files: config.delete_source_files,
+        deleted_content_type,
+    })
 }

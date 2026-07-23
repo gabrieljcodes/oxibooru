@@ -255,6 +255,25 @@ pub struct PublicConfig {
     pub privileges: PrivilegeConfig,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum StorageBackendConfig {
+    Local,
+    S3 {
+        bucket: String,
+        region: String,
+        endpoint: String,
+        access_key: String,
+        secret_key: SecretString,
+    },
+}
+
+impl Default for StorageBackendConfig {
+    fn default() -> Self {
+        StorageBackendConfig::Local
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -262,6 +281,8 @@ pub struct Config {
     pub args: Args,
     pub data_dir: PathBuf,
     pub data_url: String,
+    #[serde(default)]
+    pub storage_backend: StorageBackendConfig,
     pub webhooks: Vec<Url>,
     pub password_secret: SecretString,
     pub content_secret: SecretString,
@@ -334,12 +355,12 @@ impl Config {
         format!("{}/avatars/{double_encoded_username}.png", self.data_url.trim_end_matches('/'))
     }
 
-    /// Returns path to custom user avatar on disk.
-    pub fn custom_avatar_path(&self, lowercase_username: &str) -> PathBuf {
+    /// Returns key to custom user avatar.
+    pub fn custom_avatar_key(&self, lowercase_username: &str) -> String {
         // Encode characters that could allow for file traversal
         let encoded_username = percent_encoding::utf8_percent_encode(lowercase_username, INVALID_USERNAME_CHARS);
-        let filename = format!("{encoded_username}.png");
-        self.path(Directory::Avatars).join(filename)
+        let folder: &str = Directory::Avatars.into();
+        format!("{folder}/{encoded_username}.png")
     }
 }
 

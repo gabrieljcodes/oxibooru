@@ -290,9 +290,7 @@ impl PostInfo {
                 comments: comments.pop(),
                 pools: pools.pop(),
                 has_custom_thumbnail: fields[Field::HasCustomThumbnail].then(|| {
-                    PostHash::new(&ctx.config, post.id, Some(post.custom_thumbnail_size))
-                        .custom_thumbnail_path()
-                        .exists()
+                    post.custom_thumbnail_size > 0
                 }),
             })
             .collect::<Vec<_>>();

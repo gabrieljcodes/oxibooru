@@ -9,6 +9,7 @@ use crate::model::enums::UserRank;
 use crate::search::preferences::Preferences;
 use crate::{admin, api, db, filesystem};
 use axum::Router;
+use opendal::{services, Operator};
 use reqwest::Client as HttpClient;
 use std::error::Error;
 use std::fmt::Display;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub downloader: HttpClient,
     pub connection_pool: AsyncConnectionPool,
     pub content_cache: Arc<Mutex<RingCache>>,
+    pub operator: Operator,
 }
 
 impl AppState {
@@ -43,12 +45,31 @@ impl AppState {
     ) -> Self {
         /// Max number of elements in the content cache. Should be as large as the number of users expected to be uploading concurrently.
         const CONTENT_CACHE_SIZE: usize = 10;
+        
+        let operator = match &config.storage_backend {
+            crate::config::StorageBackendConfig::Local => {
+                let builder = services::Fs::default()
+                    .root(config.data_dir.to_str().expect("data_dir must be valid UTF-8"));
+                Operator::new(builder).expect("Failed to build local storage operator").finish()
+            }
+            crate::config::StorageBackendConfig::S3 { bucket, region, endpoint, access_key, secret_key } => {
+                let builder = services::S3::default()
+                    .bucket(bucket)
+                    .region(region)
+                    .endpoint(endpoint)
+                    .access_key_id(access_key)
+                    .secret_access_key(secret_key.read());
+                Operator::new(builder).expect("Failed to build S3 storage operator").finish()
+            }
+        };
+
         Self {
             env,
             config,
             downloader,
             connection_pool,
             content_cache: Arc::new(Mutex::new(RingCache::new(CONTENT_CACHE_SIZE))),
+            operator,
         }
     }
 
@@ -59,6 +80,7 @@ impl AppState {
                 config: self.config,
                 downloader: self.downloader,
                 content_cache: self.content_cache,
+                operator: self.operator,
             },
             self.connection_pool,
         )
@@ -71,6 +93,7 @@ pub struct Context {
     pub client: Client,
     pub downloader: HttpClient,
     pub content_cache: Arc<Mutex<RingCache>>,
+    pub operator: Operator,
 }
 
 impl Context {

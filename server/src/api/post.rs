@@ -618,7 +618,7 @@ async fn create_impl(ctx: Ctx, params: ResourceParams<Field>, body: PostCreateBo
     ctx.verify_privilege(action)?;
 
     let content =
-        Content::new(body.content_token, body.content_url).ok_or(ApiError::MissingContent(ResourceType::Post))?;
+        Content::new(body.content_token.clone(), body.content_url).ok_or(ApiError::MissingContent(ResourceType::Post))?;
     let content_properties = content.remove_or_compute_properties(ctx.clone()).await?;
 
     let custom_thumbnail = match Content::new(body.thumbnail_token, body.thumbnail_url) {
@@ -628,6 +628,26 @@ async fn create_impl(ctx: Ctx, params: ResourceParams<Field>, body: PostCreateBo
     let flags = content_properties.flags | PostFlags::from_slice(&body.flags.unwrap_or_default());
 
     let Ctx(ctx, connection_pool) = ctx;
+    
+    // We compute thumbnail sizes before the transaction
+    let generated_thumbnail_buf = {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        content_properties.thumbnail.into_rgb8().write_to(&mut buf, image::ImageFormat::Jpeg).map_err(image::error::ImageError::from)?;
+        buf.into_inner()
+    };
+    let generated_thumbnail_size = generated_thumbnail_buf.len() as i64;
+    
+    let (custom_thumbnail_buf, custom_thumbnail_size) = if let Some(thumbnail) = custom_thumbnail {
+        ctx.verify_privilege(Action::PostEditThumbnail)?;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        thumbnail.into_rgb8().write_to(&mut buf, image::ImageFormat::Jpeg).map_err(image::error::ImageError::from)?;
+        let data = buf.into_inner();
+        let size = data.len() as i64;
+        (Some(data), Some(size))
+    } else {
+        (None, None)
+    };
+
     let post_id = tagging_update(&connection_pool, body.tags.is_some(), {
         let ctx = ctx.clone();
         move |conn| {
@@ -657,7 +677,6 @@ async fn create_impl(ctx: Ctx, params: ResourceParams<Field>, body: PostCreateBo
             .get_result(conn)
             .optional()?
             .ok_or(ApiError::AlreadyExists(ResourceProperty::PostContent))?;
-            let post_hash = PostHash::new(&ctx.config, post.id, Some(post.custom_thumbnail_size));
 
             // Add tags, relations, and notes
             update::post::set_tags(conn, post.id, &tag_ids)?;
@@ -671,17 +690,12 @@ async fn create_impl(ctx: Ctx, params: ResourceParams<Field>, body: PostCreateBo
             }
             .insert_into(post_signature::table)
             .execute(conn)?;
-
-            // Move content to permanent location
-            let temp_path = content_properties.token.path(&ctx.config);
-            filesystem::move_file(&temp_path, &post_hash.content_path(content_properties.mime_type))?;
-
-            // Create thumbnails
-            if let Some(thumbnail) = custom_thumbnail {
-                ctx.verify_privilege(Action::PostEditThumbnail)?;
-                update::post::thumbnail(conn, &post_hash, thumbnail, ThumbnailCategory::Custom)?;
+            
+            let post_hash = PostHash::new(&ctx.config, post.id, custom_thumbnail_size);
+            if custom_thumbnail_size.is_some() {
+                update::post::thumbnail(conn, &post_hash, custom_thumbnail_size.unwrap(), ThumbnailCategory::Custom)?;
             }
-            update::post::thumbnail(conn, &post_hash, content_properties.thumbnail, ThumbnailCategory::Generated)?;
+            update::post::thumbnail(conn, &post_hash, generated_thumbnail_size, ThumbnailCategory::Generated)?;
 
             let post_data = SnapshotData {
                 safety: post.safety,
@@ -699,6 +713,20 @@ async fn create_impl(ctx: Ctx, params: ResourceParams<Field>, body: PostCreateBo
         }
     })
     .await?;
+    
+    // Now upload to S3!
+    let post_hash = PostHash::new(&ctx.config, post_id, custom_thumbnail_size);
+    let temp_path = content_properties.token.path(&ctx.config);
+    let content_data = tokio::fs::read(&temp_path).await?;
+    ctx.operator.write(&post_hash.content_key(content_properties.mime_type), content_data).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    ctx.operator.write(&post_hash.generated_thumbnail_key(), generated_thumbnail_buf).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    if let Some(custom_thumbnail_buf) = custom_thumbnail_buf {
+        ctx.operator.write(&post_hash.custom_thumbnail_key(), custom_thumbnail_buf).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    
+    // Delete temp file after successful upload
+    let _ = tokio::fs::remove_file(&temp_path).await;
+
     connection_pool
         .transaction(move |conn| PostInfo::new_from_id(conn, &ctx, post_id, params.fields))
         .await
@@ -840,7 +868,7 @@ async fn merge(
         return Err(ApiError::SelfMerge(ResourceType::Post));
     }
 
-    tagging_update(&connection_pool, true, {
+    let merge_actions = tagging_update(&connection_pool, true, {
         let ctx = ctx.clone();
         move |conn| {
             let absorbed_post: Post = post::table
@@ -858,12 +886,24 @@ async fn merge(
             api::verify_version(absorbed_post.last_edit_time, body.post_info.remove_version)?;
             api::verify_version(merge_to_post.last_edit_time, body.post_info.merge_to_version)?;
 
-            update::post::merge(conn, &ctx.config, &absorbed_post, &merge_to_post, body.replace_content)?;
+            let actions = update::post::merge(conn, &ctx.config, &absorbed_post, &merge_to_post, body.replace_content)?;
             snapshot::post::merge_snapshot(conn, ctx.client, absorbed_id, merge_to_id)?;
-            Ok(())
+            Ok(actions)
         }
     })
     .await?;
+    
+    let absorbed_hash = PostHash::new(&ctx.config, merge_actions.absorbed_id, merge_actions.absorbed_custom_thumbnail_size);
+    let merge_to_hash = PostHash::new(&ctx.config, merge_actions.merge_to_id, merge_actions.merge_to_custom_thumbnail_size);
+
+    if merge_actions.swap_posts {
+        filesystem::swap_posts(&ctx.operator, &absorbed_hash, merge_actions.absorbed_mime, &merge_to_hash, merge_actions.merge_to_mime).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    
+    if merge_actions.delete_source_files {
+        filesystem::delete_post(&absorbed_hash, &ctx.operator, merge_actions.deleted_content_type).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+
     connection_pool
         .transaction(move |conn| PostInfo::new_from_id(conn, &ctx, body.post_info.merge_to, params.fields))
         .await
@@ -983,10 +1023,35 @@ async fn update_impl(
         None => None,
     };
 
+    let mut generated_thumbnail_buf = None;
+    let mut generated_thumbnail_size = None;
+    if let Some(ref props) = new_content {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        props.thumbnail.clone().into_rgb8().write_to(&mut buf, image::ImageFormat::Jpeg).map_err(image::error::ImageError::from)?;
+        let data = buf.into_inner();
+        generated_thumbnail_size = Some(data.len() as i64);
+        generated_thumbnail_buf = Some(data);
+    }
+    
+    let mut custom_thumbnail_buf = None;
+    let mut custom_thumbnail_size = None;
+    if let Some(thumbnail) = custom_thumbnail {
+        ctx.0.verify_privilege(Action::PostEditThumbnail)?;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        thumbnail.into_rgb8().write_to(&mut buf, image::ImageFormat::Jpeg).map_err(image::error::ImageError::from)?;
+        let data = buf.into_inner();
+        custom_thumbnail_size = Some(data.len() as i64);
+        custom_thumbnail_buf = Some(data);
+    }
+
     let Ctx(ctx, connection_pool) = ctx;
-    tagging_update(&connection_pool, body.tags.is_some(), {
+    
+    let (old_mime_type_to_delete, new_mime_type, new_temp_path) = tagging_update(&connection_pool, body.tags.is_some(), {
         let ctx = ctx.clone();
         move |conn| {
+            let mut old_mime_type_to_delete = None;
+            let mut new_mime_type = None;
+            let mut new_temp_path = None;
             verify_visibility(conn, &ctx, post_id)?;
 
             let old_post: Post = post::table
@@ -997,7 +1062,7 @@ async fn update_impl(
             let old_mime_type = old_post.mime_type;
             api::verify_version(old_post.last_edit_time, body.version)?;
 
-            let post_hash = PostHash::new(&ctx.config, post_id, Some(old_post.custom_thumbnail_size));
+            let post_hash = PostHash::new(&ctx.config, post_id, custom_thumbnail_size.or(Some(old_post.custom_thumbnail_size)));
 
             let mut new_post = old_post.clone();
             let old_snapshot_data = SnapshotData::retrieve(conn, old_post)?;
@@ -1076,26 +1141,55 @@ async fn update_impl(
                 diesel::delete(post_signature::table.find(post_id)).execute(conn)?;
                 new_post_signature.insert_into(post_signature::table).execute(conn)?;
 
-                // Replace content
-                let temp_path = content_properties.token.path(&ctx.config);
-                filesystem::delete_content(&post_hash, old_mime_type)?;
-                filesystem::move_file(&temp_path, &post_hash.content_path(content_properties.mime_type))?;
+                old_mime_type_to_delete = Some(old_mime_type);
+                new_mime_type = Some(content_properties.mime_type);
+                new_temp_path = Some(content_properties.token.path(&ctx.config));
 
                 // Replace generated thumbnail
-                update::post::thumbnail(conn, &post_hash, content_properties.thumbnail, ThumbnailCategory::Generated)?;
+                update::post::thumbnail(conn, &post_hash, generated_thumbnail_size.unwrap(), ThumbnailCategory::Generated)?;
             }
-            if let Some(thumbnail) = custom_thumbnail {
-                ctx.verify_privilege(Action::PostEditThumbnail)?;
-                update::post::thumbnail(conn, &post_hash, thumbnail, ThumbnailCategory::Custom)?;
+            
+            if custom_thumbnail_size.is_some() {
+                update::post::thumbnail(conn, &post_hash, custom_thumbnail_size.unwrap(), ThumbnailCategory::Custom)?;
             }
 
             new_post.last_edit_time = DateTime::now();
             let _: Post = error::map_unique_violation(new_post.save_changes(conn), ResourceProperty::PostContent)?;
             snapshot::post::modification_snapshot(conn, ctx.client, post_id, old_snapshot_data, new_snapshot_data)?;
-            Ok(())
+            
+            let old_mime_to_del = old_mime_type_to_delete; // Need to return them
+            Ok((old_mime_to_del, new_mime_type, new_temp_path))
         }
     })
     .await?;
+    
+    // We can't access old_post outside the closure directly, but we can re-fetch it or just construct post_hash
+    let current_post_custom_thumbnail_size = connection_pool.transaction({
+        move |conn| {
+            let p: Post = post::table.find(post_id).first(conn)?;
+            Ok::<_, ApiError>(p.custom_thumbnail_size)
+        }
+    }).await?;
+    let post_hash = PostHash::new(&ctx.config, post_id, Some(current_post_custom_thumbnail_size));
+    
+    if let Some(old_mime) = old_mime_type_to_delete {
+        filesystem::delete_content(&post_hash, &ctx.operator, old_mime).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    
+    if let Some(temp_path) = new_temp_path {
+        let content_data = tokio::fs::read(&temp_path).await?;
+        ctx.operator.write(&post_hash.content_key(new_mime_type.unwrap()), content_data).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    
+    if let Some(gen_buf) = generated_thumbnail_buf {
+        ctx.operator.write(&post_hash.generated_thumbnail_key(), gen_buf).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    
+    if let Some(cust_buf) = custom_thumbnail_buf {
+        ctx.operator.write(&post_hash.custom_thumbnail_key(), cust_buf).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+
     connection_pool
         .transaction(move |conn| PostInfo::new_from_id(conn, &ctx, post_id, params.fields))
         .await
@@ -1260,7 +1354,7 @@ async fn delete(
         .await?;
     if ctx.config.delete_source_files {
         let post_hash = PostHash::new(&ctx.config, post_id, Some(custom_thumbnail_size));
-        filesystem::delete_post(&post_hash, mime_type)?;
+        filesystem::delete_post(&post_hash, &ctx.operator, mime_type).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     }
     Ok(Json(()))
 }

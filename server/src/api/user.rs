@@ -195,7 +195,7 @@ async fn create_impl(ctx: Ctx, params: ResourceParams<Field>, body: UserCreateBo
     };
 
     let Ctx(ctx, connection_pool) = ctx;
-    let user_id = connection_pool
+    let (user_id, custom_avatar_buf, lowercase_name) = connection_pool
         .transaction({
             let ctx = ctx.clone();
             move |conn| {
@@ -231,19 +231,35 @@ async fn create_impl(ctx: Ctx, params: ResourceParams<Field>, body: UserCreateBo
                 .optional()?
                 .ok_or(ApiError::AlreadyExists(ResourceProperty::UserEmail))?;
 
-                if let Some(avatar) = custom_avatar {
+                let mut custom_avatar_buf = None;
+                let mut custom_avatar_size = None;
+                if let Some(thumbnail) = custom_avatar {
+                    let mut buf = std::io::Cursor::new(Vec::new());
+                    thumbnail.into_rgb8().write_to(&mut buf, image::ImageFormat::Png).map_err(image::error::ImageError::from)?;
+                    let data = buf.into_inner();
+                    custom_avatar_size = Some(data.len() as i64);
+                    custom_avatar_buf = Some(data);
+                }
+                
+                if custom_avatar_size.is_some() {
                     ctx.verify_privilege(Action::UserEditSelfAvatar)?;
                     if !creating_self {
                         ctx.verify_privilege(Action::UserEditAnyAvatar)?;
                     }
 
-                    update::user::avatar(conn, &ctx.config, user_id, &lowercase_name, avatar)?;
+                    update::user::avatar(conn, user_id, custom_avatar_size.unwrap())?;
                 }
 
-                Ok::<_, ApiError>(user_id)
+                Ok::<_, ApiError>((user_id, custom_avatar_buf, lowercase_name))
             }
         })
         .await?;
+        
+    if let Some(buf) = custom_avatar_buf {
+        let avatar_key = ctx.config.custom_avatar_key(&lowercase_name);
+        ctx.operator.write(&avatar_key, buf).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    
     connection_pool
         .transaction(move |conn| UserInfo::new_from_id(conn, &ctx.config, user_id, params.fields, Visibility::Full))
         .await
@@ -338,12 +354,24 @@ async fn update_impl(
         }
         None => None,
     };
+    
+    let mut custom_avatar_buf = None;
+    let mut custom_avatar_size = None;
+    if let Some(thumbnail) = custom_avatar {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        thumbnail.into_rgb8().write_to(&mut buf, image::ImageFormat::Png).map_err(image::error::ImageError::from)?;
+        let data = buf.into_inner();
+        custom_avatar_size = Some(data.len() as i64);
+        custom_avatar_buf = Some(data);
+    }
 
     let Ctx(ctx, connection_pool) = ctx;
-    let (user_id, visibility) = connection_pool
+    
+    let (user_id, visibility, new_name_lowercase, rename_avatar) = connection_pool
         .transaction({
             let ctx = ctx.clone();
             move |conn| {
+                let mut rename_avatar = None;
                 let (user_id, lowercase_name, user_version, target_rank): (_, SmallString, _, _) = user::table
                     .select((user::id, lower(user::name), user::last_edit_time, user::rank))
                     .filter(user::name.eq(&username))
@@ -409,14 +437,16 @@ async fn update_impl(
                         .set(user::avatar_style.eq(avatar_style))
                         .execute(conn)?;
                 }
-                if let Some(avatar) = custom_avatar {
+                if custom_avatar_size.is_some() {
                     ctx.verify_privilege(Action::UserEditSelfAvatar)?;
                     if !editing_self {
                         ctx.verify_privilege(Action::UserEditAnyAvatar)?;
                     }
 
-                    update::user::avatar(conn, &ctx.config, user_id, &lowercase_name, avatar)?;
+                    update::user::avatar(conn, user_id, custom_avatar_size.unwrap())?;
                 }
+                
+                let mut resulting_name_lowercase = lowercase_name.clone();
                 if let Some(new_name) = body.name.as_deref() {
                     ctx.verify_privilege(Action::UserEditSelfName)?;
                     if !editing_self {
@@ -429,21 +459,28 @@ async fn update_impl(
                         .set(user::name.eq(new_name))
                         .returning(lower(user::name))
                         .get_result(conn);
-                    let new_name_lowercase: SmallString =
-                        error::map_unique_violation(update_result, ResourceProperty::UserName)?;
-
-                    let old_custom_avatar_path = ctx.config.custom_avatar_path(&lowercase_name);
-                    if old_custom_avatar_path.try_exists()? {
-                        let new_custom_avatar_path = ctx.config.custom_avatar_path(&new_name_lowercase);
-                        filesystem::move_file(&old_custom_avatar_path, &new_custom_avatar_path)?;
-                    }
+                    resulting_name_lowercase = error::map_unique_violation(update_result, ResourceProperty::UserName)?;
+                    
+                    rename_avatar = Some((lowercase_name, resulting_name_lowercase.clone()));
                 }
                 update::user::last_edit_time(conn, user_id)
-                    .map(|()| (user_id, visibility))
+                    .map(|()| (user_id, visibility, resulting_name_lowercase, rename_avatar))
                     .map_err(ApiError::from)
             }
         })
         .await?;
+        
+    if let Some(buf) = custom_avatar_buf {
+        let avatar_key = ctx.config.custom_avatar_key(&new_name_lowercase);
+        ctx.operator.write(&avatar_key, buf).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    } else if let Some((old_name, new_name)) = rename_avatar {
+        let old_key = ctx.config.custom_avatar_key(&old_name);
+        if ctx.operator.exists(&old_key).await.unwrap_or(false) {
+            let new_key = ctx.config.custom_avatar_key(&new_name);
+            filesystem::move_file(&ctx.operator, &old_key, &new_key).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        }
+    }
+        
     connection_pool
         .transaction(move |conn| UserInfo::new_from_id(conn, &ctx.config, user_id, params.fields, visibility))
         .await

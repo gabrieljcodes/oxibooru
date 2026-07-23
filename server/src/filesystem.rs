@@ -12,6 +12,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
+use opendal::Operator;
 
 /// Represents important data directories.
 #[derive(Clone, Copy, Display, IntoStaticStr)]
@@ -64,113 +66,102 @@ where
     Ok(upload_token)
 }
 
-/// Saves custom avatar `thumbnail` for user with name `username` to disk.
+/// Saves custom avatar `thumbnail` for user with name `username` to disk/S3.
 /// Returns size of the thumbnail in bytes.
-pub fn save_custom_avatar(config: &Config, lowercase_username: &str, thumbnail: DynamicImage) -> ImageResult<i64> {
-    std::fs::create_dir_all(config.path(Directory::Avatars))?;
-
-    let avatar_path = config.custom_avatar_path(lowercase_username);
-    thumbnail.into_rgb8().save(&avatar_path)?;
-    file_size(&avatar_path).map_err(ImageError::from)
+pub async fn save_custom_avatar(config: &Config, operator: &Operator, lowercase_username: &str, thumbnail: DynamicImage) -> ApiResult<i64> {
+    let avatar_key = config.custom_avatar_key(lowercase_username);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    thumbnail.into_rgb8().write_to(&mut buf, image::ImageFormat::Png).map_err(ImageError::from)?;
+    let data = buf.into_inner();
+    let size = data.len() as i64;
+    operator.write(&avatar_key, data).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    Ok(size)
 }
 
-/// Deletes custom avatar for user with name `username` from disk, if it exists.
-pub fn delete_custom_avatar(config: &Config, lowercase_username: &str) -> std::io::Result<()> {
-    let custom_avatar_path = config.custom_avatar_path(lowercase_username);
-    remove_if_exists(&custom_avatar_path)
+/// Deletes custom avatar for user with name `username` from disk/S3, if it exists.
+pub async fn delete_custom_avatar(config: &Config, operator: &Operator, lowercase_username: &str) -> ApiResult<()> {
+    let custom_avatar_key = config.custom_avatar_key(lowercase_username);
+    remove_if_exists_async(operator, &custom_avatar_key).await?;
+    Ok(())
 }
 
-/// Saves `post` `thumbnail` to disk. Can be custom or automatically generated.
+/// Saves `post` `thumbnail` to disk/S3. Can be custom or automatically generated.
 /// Returns size of the thumbnail in bytes.
-pub fn save_post_thumbnail(
-    post: &PostHash,
+pub async fn save_post_thumbnail(
+    post: &PostHash<'_>,
+    operator: &Operator,
     thumbnail: DynamicImage,
     thumbnail_type: ThumbnailCategory,
-) -> ImageResult<i64> {
-    let thumbnail_path = match thumbnail_type {
-        ThumbnailCategory::Generated => post.generated_thumbnail_path(),
-        ThumbnailCategory::Custom => post.custom_thumbnail_path(),
+) -> ApiResult<i64> {
+    let thumbnail_key = match thumbnail_type {
+        ThumbnailCategory::Generated => post.generated_thumbnail_key(),
+        ThumbnailCategory::Custom => post.custom_thumbnail_key(),
     };
-    std::fs::create_dir_all(thumbnail_path.parent().unwrap_or(Path::new("")))?;
-
-    thumbnail.into_rgb8().save(&thumbnail_path)?;
-    file_size(&thumbnail_path).map_err(ImageError::from)
+    let mut buf = std::io::Cursor::new(Vec::new());
+    thumbnail.into_rgb8().write_to(&mut buf, image::ImageFormat::Jpeg).map_err(ImageError::from)?;
+    let data = buf.into_inner();
+    let size = data.len() as i64;
+    operator.write(&thumbnail_key, data).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    Ok(size)
 }
 
-/// Deletes thumbnail of `post` from disk, if it exists.
-pub fn delete_post_thumbnail(post: &PostHash, thumbnail_type: ThumbnailCategory) -> std::io::Result<()> {
-    let thumbnail_path = match thumbnail_type {
-        ThumbnailCategory::Generated => post.generated_thumbnail_path(),
-        ThumbnailCategory::Custom => post.custom_thumbnail_path(),
+/// Deletes thumbnail of `post` from disk/S3, if it exists.
+pub async fn delete_post_thumbnail(post: &PostHash<'_>, operator: &Operator, thumbnail_type: ThumbnailCategory) -> std::io::Result<()> {
+    let thumbnail_key = match thumbnail_type {
+        ThumbnailCategory::Generated => post.generated_thumbnail_key(),
+        ThumbnailCategory::Custom => post.custom_thumbnail_key(),
     };
-    remove_if_exists(&thumbnail_path)
+    remove_if_exists_async(operator, &thumbnail_key).await
 }
 
-/// Deletes `post` content from disk.
-pub fn delete_content(post: &PostHash, mime_type: MimeType) -> std::io::Result<()> {
-    let content_path = post.content_path(mime_type);
-    remove_if_exists(&content_path)
+/// Deletes `post` content from disk/S3.
+pub async fn delete_content(post: &PostHash<'_>, operator: &Operator, mime_type: MimeType) -> std::io::Result<()> {
+    let content_key = post.content_key(mime_type);
+    remove_if_exists_async(operator, &content_key).await
 }
 
-/// Deletes `post` thumbnails and content from disk.
-pub fn delete_post(post: &PostHash, mime_type: MimeType) -> std::io::Result<()> {
-    delete_post_thumbnail(post, ThumbnailCategory::Generated)?;
-    delete_post_thumbnail(post, ThumbnailCategory::Custom)?;
-    delete_content(post, mime_type)
+/// Deletes `post` thumbnails and content from disk/S3.
+pub async fn delete_post(post: &PostHash<'_>, operator: &Operator, mime_type: MimeType) -> std::io::Result<()> {
+    delete_post_thumbnail(post, operator, ThumbnailCategory::Generated).await?;
+    delete_post_thumbnail(post, operator, ThumbnailCategory::Custom).await?;
+    delete_content(post, operator, mime_type).await
 }
 
 /// Renames the contents and thumbnails of two posts as if they had swapped ids.
-pub fn swap_posts(
-    config: &Config,
-    post_a: &PostHash,
+pub async fn swap_posts(
+    operator: &Operator,
+    post_a: &PostHash<'_>,
     mime_type_a: MimeType,
-    post_b: &PostHash,
+    post_b: &PostHash<'_>,
     mime_type_b: MimeType,
 ) -> std::io::Result<()> {
     // No special cases needed here because generated thumbnails always exists and their type is always .jpg
-    swap_files(config, &post_a.generated_thumbnail_path(), &post_b.generated_thumbnail_path())?;
+    swap_files(operator, &post_a.generated_thumbnail_key(), &post_b.generated_thumbnail_key()).await?;
 
     // Handle the four distinct cases of custom thumbnails existing/not existing
-    let custom_thumbnail_path_a = post_a.custom_thumbnail_path();
-    let custom_thumbnail_path_b = post_b.custom_thumbnail_path();
-    match (custom_thumbnail_path_a.try_exists()?, custom_thumbnail_path_b.try_exists()?) {
-        (true, true) => swap_files(config, &custom_thumbnail_path_a, &custom_thumbnail_path_b)?,
-        (true, false) => move_file(&custom_thumbnail_path_a, &custom_thumbnail_path_b)?,
-        (false, true) => move_file(&custom_thumbnail_path_b, &custom_thumbnail_path_a)?,
+    let custom_thumbnail_key_a = post_a.custom_thumbnail_key();
+    let custom_thumbnail_key_b = post_b.custom_thumbnail_key();
+    match (operator.exists(&custom_thumbnail_key_a).await.unwrap_or(false), operator.exists(&custom_thumbnail_key_b).await.unwrap_or(false)) {
+        (true, true) => swap_files(operator, &custom_thumbnail_key_a, &custom_thumbnail_key_b).await?,
+        (true, false) => move_file(operator, &custom_thumbnail_key_a, &custom_thumbnail_key_b).await?,
+        (false, true) => move_file(operator, &custom_thumbnail_key_b, &custom_thumbnail_key_a).await?,
         (false, false) => (),
     }
 
     // Contents can have same MIME type or different MIME types
-    let old_image_path_a = post_a.content_path(mime_type_a);
-    let old_image_path_b = post_b.content_path(mime_type_b);
+    let old_image_key_a = post_a.content_key(mime_type_a);
+    let old_image_key_b = post_b.content_key(mime_type_b);
     if mime_type_a == mime_type_b {
-        swap_files(config, &old_image_path_a, &old_image_path_b)
+        swap_files(operator, &old_image_key_a, &old_image_key_b).await
     } else {
-        move_file(&old_image_path_a, &post_b.content_path(mime_type_a))?;
-        move_file(&old_image_path_b, &post_a.content_path(mime_type_b))
+        move_file(operator, &old_image_key_a, &post_b.content_key(mime_type_a)).await?;
+        move_file(operator, &old_image_key_b, &post_a.content_key(mime_type_b)).await
     }
 }
 
 /// Moves file from `from` to `to`.
-/// Tries simply renaming first and falls back to copy/remove if `from` and `to`
-/// are on different file systems.
-pub fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to.parent().unwrap_or(Path::new("")))?;
-    if let Err(err) = std::fs::rename(from, to) {
-        if err.kind() == ErrorKind::CrossesDevices {
-            std::fs::copy(from, to)?;
-            std::fs::remove_file(from)?;
-        } else {
-            return Err(err);
-        }
-    }
-
-    // Set appropriate permissions since we usually use this function to move
-    // content to a permanent location
-    if let Err(err) = set_permissions(to) {
-        warn!("Failed to set permissions for {} for reason: {err}", to.display());
-    }
-    Ok(())
+pub async fn move_file(operator: &Operator, from: &str, to: &str) -> std::io::Result<()> {
+    operator.rename(from, to).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
 /// Spawns an asynchronous task that periodically checks the temporary
@@ -191,12 +182,18 @@ pub fn spawn_temporary_uploads_cleanup_task(config: Arc<Config>) {
 
 /// Removes `file` if it exists.
 fn remove_if_exists(file: &Path) -> std::io::Result<()> {
-    if let Err(err) = std::fs::remove_file(file)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        Err(err)
-    } else {
-        Ok(())
+    if let Err(err) = std::fs::remove_file(file) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+async fn remove_if_exists_async(operator: &Operator, key: &str) -> std::io::Result<()> {
+    match operator.delete(key).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
 }
 
@@ -261,15 +258,14 @@ fn remove_stale_uploads(config: &Config, uploads: &mut HashMap<PathBuf, u64>) {
 }
 
 /// Swaps the names of two files.
-fn swap_files(config: &Config, file_a: &Path, file_b: &Path) -> std::io::Result<()> {
-    let temp_path = config
-        .path(Directory::TemporaryUploads)
-        .join(file_a.file_name().unwrap_or(OsStr::new("post.tmp")));
-    move_file(file_a, &temp_path)?;
-    move_file(file_b, file_a)?;
-    move_file(&temp_path, file_b)
+async fn swap_files(operator: &Operator, file_a: &str, file_b: &str) -> std::io::Result<()> {
+    let temp_path = format!("{}.tmp", file_a);
+    move_file(operator, file_a, &temp_path).await?;
+    move_file(operator, file_b, file_a).await?;
+    move_file(operator, &temp_path, file_b).await
 }
 
+#[cfg(unix)]
 /// Makes `path` readable to world. Used to avoid permissions issues on some systems.
 fn set_permissions(path: &Path) -> std::io::Result<()> {
     const STANDARD_PERMISSIONS: u32 = 0o644;

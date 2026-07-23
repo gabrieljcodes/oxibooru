@@ -12,12 +12,10 @@ services:
         # operations such as reverse search, but makes binary less portable.
         # Leave blank to let Rust determine the target architecture. 
         TARGET_CPU:
-    depends_on:
-      - sql
     environment:
       # These should be the names of the dependent containers listed below,
       # or FQDNs/IP addresses if these services are running outside of Docker
-      POSTGRES_HOST: sql
+      POSTGRES_HOST: ${POSTGRES_HOST:-sql}
       POSTGRES_USER:
       POSTGRES_PASSWORD:
       POSTGRES_DB:

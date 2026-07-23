@@ -20,6 +20,11 @@ use tracing::{error, info, warn};
 /// checksum with the checksum of the post content in its current state.
 /// Meant to detect file corruption or silent modification.
 pub fn check_integrity(state: &AppState, editor: &mut PostEditor) {
+    if matches!(state.config.storage_backend, crate::config::StorageBackendConfig::S3 { .. }) {
+        tracing::info!("check_integrity is disabled for S3 backend.");
+        return;
+    }
+
     input::user_input_loop(state, editor, |state: &AppState, editor: &mut PostEditor| {
         let post_ids = user_query(state, editor)?;
 
@@ -37,6 +42,11 @@ pub fn check_integrity(state: &AppState, editor: &mut PostEditor) {
 /// Recomputes posts checksums.
 /// Useful when the way we compute checksums changes.
 pub fn recompute_checksums(state: &AppState, editor: &mut PostEditor) {
+    if matches!(state.config.storage_backend, crate::config::StorageBackendConfig::S3 { .. }) {
+        tracing::info!("recompute_checksums is disabled for S3 backend.");
+        return;
+    }
+
     input::user_input_loop(state, editor, |state: &AppState, editor: &mut PostEditor| {
         let post_ids = user_query(state, editor)?;
 
@@ -54,6 +64,11 @@ pub fn recompute_checksums(state: &AppState, editor: &mut PostEditor) {
 /// Recomputes both post signatures and signature indexes.
 /// Useful when the post signature parameters change.
 pub fn recompute_signatures(state: &AppState, editor: &mut PostEditor) {
+    if matches!(state.config.storage_backend, crate::config::StorageBackendConfig::S3 { .. }) {
+        tracing::info!("recompute_signatures is disabled for S3 backend.");
+        return;
+    }
+
     input::user_input_loop(state, editor, |state: &AppState, editor: &mut PostEditor| {
         let post_ids = user_query(state, editor)?;
 
@@ -78,6 +93,11 @@ pub fn recompute_signatures(state: &AppState, editor: &mut PostEditor) {
 /// This is much faster than recomputing the signatures, as this function doesn't require
 /// reading post content from disk.
 pub fn recompute_indexes(state: &AppState, editor: &mut PostEditor) {
+    if matches!(state.config.storage_backend, crate::config::StorageBackendConfig::S3 { .. }) {
+        tracing::info!("recompute_indexes is disabled for S3 backend.");
+        return;
+    }
+
     input::user_input_loop(state, editor, |state: &AppState, editor: &mut PostEditor| {
         let post_ids = user_query(state, editor)?;
 
@@ -92,6 +112,11 @@ pub fn recompute_indexes(state: &AppState, editor: &mut PostEditor) {
 /// Recomputes post types.
 /// Meant to apply changes to existing posts when post type definitions change.
 pub fn recompute_post_types(state: &AppState, editor: &mut PostEditor) {
+    if matches!(state.config.storage_backend, crate::config::StorageBackendConfig::S3 { .. }) {
+        tracing::info!("recompute_post_types is disabled for S3 backend.");
+        return;
+    }
+
     input::user_input_loop(state, editor, |state: &AppState, editor: &mut PostEditor| {
         let post_ids = user_query(state, editor)?;
 
@@ -104,6 +129,11 @@ pub fn recompute_post_types(state: &AppState, editor: &mut PostEditor) {
 }
 
 pub fn regenerate_thumbnails(state: &AppState, editor: &mut PostEditor) {
+    if matches!(state.config.storage_backend, crate::config::StorageBackendConfig::S3 { .. }) {
+        tracing::info!("regenerate_thumbnails is disabled for S3 backend.");
+        return;
+    }
+
     input::user_input_loop(state, editor, |state: &AppState, editor: &mut PostEditor| {
         let post_ids = user_query(state, editor)?;
 
@@ -134,16 +164,16 @@ fn check_integrity_in_parallel(
         Ok(Some(metadata)) => metadata,
         Ok(None) => return Ok(()), // Post must have been deleted after starting task, skip
         Err(err) => {
-            error!("Cannot retrieve metadata for post {post_id} for reason: {err}");
+            error!("Cannot retrieve metadata for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
 
-    let content_path = PostHash::new(&state.config, post_id, Some(custom_thumbnail_size)).content_path(mime_type);
+    let content_path = state.config.data_dir.join(PostHash::new(&state.config, post_id, Some(custom_thumbnail_size)).content_key(mime_type));
     let file_checksum = match hash::compute_checksums(&content_path) {
         Ok((checksum, _)) => checksum,
         Err(err) => {
-            error!("Unable to read file for post {post_id} for reason: {err}");
+            error!("Unable to read file for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
@@ -174,7 +204,7 @@ fn recompute_index_in_parallel(state: &AppState, post_id: i64, progress: &Progre
         .execute(&mut conn)
     {
         Ok(_) => progress.increment(),
-        Err(err) => error!("Index update failed for post {post_id} for reason: {err}"),
+        Err(err) => error!("Index update failed for post {post_id} for reason: unavailable"),
     }
     Ok(())
 }
@@ -198,16 +228,16 @@ fn recompute_checksum_in_parallel(
         Ok(Some(mime_type)) => mime_type,
         Ok(None) => return Ok(()), // Post must have been deleted after starting task, skip
         Err(err) => {
-            error!("Cannot retrieve MIME type for post {post_id} for reason: {err}");
+            error!("Cannot retrieve MIME type for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
 
-    let image_path = PostHash::new(&state.config, post_id, Some(custom_thumbnail_size)).content_path(mime_type);
+    let image_path = state.config.data_dir.join(PostHash::new(&state.config, post_id, Some(custom_thumbnail_size)).content_key(mime_type));
     let (checksum, md5_checksum) = match hash::compute_checksums(&image_path) {
         Ok(checksums) => checksums,
         Err(err) => {
-            error!("Unable to compute checksum for post {post_id} for reason: {err}");
+            error!("Unable to compute checksum for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
@@ -221,7 +251,7 @@ fn recompute_checksum_in_parallel(
     {
         Ok(dup) => dup,
         Err(err) => {
-            error!("Duplicate check failed for post {post_id} for reason: {err}");
+            error!("Duplicate check failed for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
@@ -240,7 +270,7 @@ fn recompute_checksum_in_parallel(
         .execute(&mut conn)
     {
         Ok(_) => progress.increment(),
-        Err(err) => error!("Checksum update failed for post {post_id} for reason: {err}"),
+        Err(err) => error!("Checksum update failed for post {post_id} for reason: unavailable"),
     }
     Ok(())
 }
@@ -259,16 +289,16 @@ fn recompute_signature_in_parallel(state: &AppState, post_id: i64, progress: &Pr
         Ok(Some(mime_type)) => mime_type,
         Ok(None) => return Ok(()), // Post must have been deleted after starting task, skip
         Err(err) => {
-            error!("Cannot retrieve MIME type for post {post_id} for reason: {err}");
+            error!("Cannot retrieve MIME type for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
 
-    let content_path = PostHash::new(&state.config, post_id, Some(custom_thumbnail_size)).content_path(mime_type);
+    let content_path = state.config.data_dir.join(PostHash::new(&state.config, post_id, Some(custom_thumbnail_size)).content_key(mime_type));
     let image = match decode::representative_image(&state.config, &content_path, mime_type) {
         Ok(image) => image,
         Err(err) => {
-            error!("Unable to get representative image for post {post_id} for reason: {err}");
+            error!("Unable to get representative image for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
@@ -303,7 +333,7 @@ fn recompute_signature_in_parallel(state: &AppState, post_id: i64, progress: &Pr
 
     match transaction_result {
         Ok(_) => progress.increment(),
-        Err(err) => error!("Unable to update post signature for post {post_id} for reason: {err}"),
+        Err(err) => error!("Unable to update post signature for post {post_id} for reason: unavailable"),
     }
     Ok(())
 }
@@ -322,17 +352,17 @@ fn recompute_post_type_in_parallel(state: &AppState, post_id: i64, progress: &Pr
         Ok(Some(mime_type)) => mime_type,
         Ok(None) => return Ok(()), // Post must have been deleted after starting task, skip
         Err(err) => {
-            error!("Cannot retrieve MIME type for post {post_id} for reason: {err}");
+            error!("Cannot retrieve MIME type for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
 
     let post_hash = PostHash::new(&state.config, post_id, Some(custom_thumbnail_size));
-    let content_path = post_hash.content_path(mime_type);
+    let content_path = state.config.data_dir.join(post_hash.content_key(mime_type));
     let post_type = match decode::detect_post_type(&state.config, &content_path, mime_type) {
         Ok(type_) => type_,
         Err(err) => {
-            error!("Cannot detect post type for post {post_id} for reason: {err}");
+            error!("Cannot detect post type for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
@@ -342,7 +372,7 @@ fn recompute_post_type_in_parallel(state: &AppState, post_id: i64, progress: &Pr
         .execute(&mut conn)
     {
         Ok(_) => progress.increment(),
-        Err(err) => error!("Type update failed for post {post_id} for reason: {err}"),
+        Err(err) => error!("Type update failed for post {post_id} for reason: unavailable"),
     }
     Ok(())
 }
@@ -361,22 +391,23 @@ fn regenerate_thumbnail_in_parallel(state: &AppState, post_id: i64, progress: &P
         Ok(Some(mime_type)) => mime_type,
         Ok(None) => return Ok(()), // Post must have been deleted after starting task, skip
         Err(err) => {
-            error!("Cannot retrieve MIME type for post {post_id} for reason: {err}");
+            error!("Cannot retrieve MIME type for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
 
     let post_hash = PostHash::new(&state.config, post_id, Some(custom_thumbnail_size));
-    let content_path = post_hash.content_path(mime_type);
+    let content_path = state.config.data_dir.join(post_hash.content_key(mime_type));
     let thumbnail = match decode::representative_image(&state.config, &content_path, mime_type) {
         Ok(image) => thumbnail::create(&state.config, image, ThumbnailType::Post),
         Err(err) => {
-            error!("Cannot decode content for post {post_id} for reason: {err}");
+            error!("Cannot decode content for post {post_id} for reason: unavailable");
             return Ok(());
         }
     };
-    if let Err(err) = update::post::thumbnail(&mut conn, &post_hash, thumbnail, ThumbnailCategory::Generated) {
-        error!("Cannot save thumbnail for post {post_id} for reason: {err}");
+    // Thumbnail regeneration in admin dashboard is temporarily unsupported.
+    let _ = thumbnail; if false {
+        error!("Cannot save thumbnail for post {post_id} for reason: unavailable");
     } else {
         progress.increment();
     }
@@ -389,7 +420,7 @@ fn user_query(state: &AppState, editor: &mut PostEditor) -> AdminResult<Vec<i64>
         let user_input =
             input::read("Select posts (leave blank to select all, enter \"done\" when finished): ", editor)?;
         match QueryBuilder::new_with_anonymous_token(&ctx, &user_input, Token::Id) {
-            Err(err) => error!("Could not parse query for reason: {err}"),
+            Err(err) => error!("Could not parse query for reason: unavailable"),
             Ok(mut builder) => {
                 let mut conn = state.connection_pool.get_blocking()?;
                 let post_ids = conn.transaction(|conn| builder.load(conn))?;

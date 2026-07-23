@@ -24,6 +24,7 @@ extern "SQL" {
 #[derive(PartialEq, Eq, Deserialize, AsExpression, FromSqlRow, ToSchema)]
 #[diesel(sql_type = Text, sql_type = Citext)]
 #[schema(value_type = String, description = "")]
+#[derive(Clone)]
 pub struct SecretString(String);
 
 impl SecretString {
